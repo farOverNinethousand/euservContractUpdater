@@ -1,3 +1,5 @@
+import argparse
+from datetime import datetime
 import imaplib
 import json
 import os
@@ -5,8 +7,11 @@ import re
 import sys
 
 import mechanize
+from mechanize import FormNotFoundError
 
 EUSERV_BASE = 'https://support.euserv.com/'
+PATH_COOKIES = os.path.join('cookies.txt')
+PATH_SAVESTATE = os.path.join('savestate.json')
 
 def isLoggedInEuserv(html: str) -> bool:
     if 'action=logout' in html:
@@ -41,8 +46,8 @@ class ContractUpdater:
             connection.login(self.imap_login, self.imap_password)
             print('E-Mail Login erfolgreich')
             return connection
-        except Exception as e:
-            print(e)
+        except Exception as ex:
+            print(ex)
             print('E-Mail Login fehlgeschlagen!')
             print('Falls du GMail Benutzer bist, aktiviere den Zugriff durch weniger sichere Apps hier: https://myaccount.google.com/lesssecureapps')
             return None
@@ -50,40 +55,53 @@ class ContractUpdater:
     def loginEuserv(self):
         br = getNewBrowser()
         # TODO: Fix loadCookies handling
-        # cookies = mechanize.LWPCookieJar(getCookiesPath())
-        cookies = None
-        if cookies is not None and os.path.exists(getCookiesPath()):
+        cookies = mechanize.LWPCookieJar(PATH_COOKIES)
+        if cookies is not None and os.path.exists(PATH_COOKIES):
             # Try to login via stored cookies first
             print('Versuche Login ueber zuvor gespeicherte Cookies ...')
             br.set_cookiejar(cookies)
         response = br.open(EUSERV_BASE)
         html = getHTML(response)
         if not isLoggedInEuserv(html):
-            if cookies is not None and os.path.exists(getCookiesPath()):
+            if cookies is not None and os.path.exists(PATH_COOKIES):
                 print('Login ueber Cookies fehlgeschlagen --> Versuche vollstaendigen Login')
-            br.open(EUSERV_BASE)
-            foundForm = False
-            form_index = 0
-            for form in br.forms():
-                if 'step1_anmeldung' in form:
-                    foundForm = True
-                    br.select_form(nr=form_index)
-                    break
-                form_index += 1
-            if not foundForm:
-                print('Fataler Fehler: Konnte Loginform nicht finden...')
+            try:
+                br.select_form(name_=lambda x: 'step1_anmeldung' in x)
+                # WTF form is found but all fields are missing
+                sess_idRegex = re.compile(r'sess_id=([a-f0-9]+)').search(html)
+                sess_id = None
+                if sess_idRegex:
+                    sess_id = sess_idRegex.group(1)
+                # br.form.set_all_readonly(False)
+                br.form.new_control('text', 'email', {'email': ''})
+                br.form.new_control('text', 'password', {'password': ''})
+                br.form.new_control('text', 'form_selected_language', {'form_selected_language': ''})
+                br.form.new_control('text', 'Submit', {'Submit': ''})
+                br.form.new_control('text', 'subaction', {'subaction': ''})
+                br.form.new_control('text', 'sess_id', {'sess_id': ''})
+
+                br.form.fixup()
+                br['email'] = self.euserv_login
+                br['password'] = self.euserv_password
+                br['form_selected_language'] = 'de'
+                br['Submit'] = 'Anmelden'
+                br['subaction'] = 'login'
+                br['sess_id'] = sess_id
+                response = br.submit()
+                html = getHTML(response)
+            except FormNotFoundError:
+                print('Konnte Loginform nicht finden - evtl. wird nur 2FA login benoetigt...')
                 sys.exit()
-            br['email'] = self.euserv_login
-            br['password'] = self.euserv_password
-            response = br.submit()
-            html = getHTML(response)
+        # TODO: Simplify this
+        if setFormBySubmitKey(br, 'pin'):
             # TODO: Add support for 2FA login
-            if not isLoggedInEuserv(html):
-                print('Login fehlgeschlagen - Ungueltige Zugangsdaten?')
-                return br, False
-            print('Vollstaendiger Login erfolgreich')
+            pass
+        if not isLoggedInEuserv(html):
+            print('Login fehlgeschlagen - Ungueltige Zugangsdaten?')
+            return br, False
+        print('Euserv Login erfolgreich')
+        # Store cookies so we can re-use them next time
         cookies = br._ua_handlers['_cookies'].cookiejar
-        print('Speichere Cookies in ' + 'TODO')
         cookies.save()
         return br, True
 
@@ -97,8 +115,9 @@ class ContractUpdater:
             # E.g. 'NO' = Invalid mailbox (should never happen)
             print("Keine Postfaecher gefunden")
             return
-        # print('Anzahl gefundener Postfaecher: %d' % len(data))
-        # this maybe used to speed-up the checking process - users can blacklist postboxes through this list
+        print('Sammle Vertragsverlaengerungs-E-Mails ...')
+
+        # This can be used to speed-up the checking process - users can blacklist postboxes through this list
         postbox_ignore = ['Sent']
         numberof_postboxes = len(data)
         postbox_index = 0
@@ -120,7 +139,6 @@ class ContractUpdater:
                 # 2020-01-03: Skip invalid mailboxes - this may happen frequently with gmail accounts (missing permissions?)
                 continue
             # Search for specific messages by subject
-            print(f'Schritt 1 / {total_postbox_steps}: Sammle Vertragsverlaengerungs-E-Mails ...')
             mails += crawlMailsBySubject(connection, 'Anstehende manuelle Vertragsverlaengerung fuer Vertrag')
         serverContractID = None
         for mail in mails:
@@ -132,12 +150,25 @@ class ContractUpdater:
             print("Es wurde keine Mail zur anstehenden Vertragsverlaengerung gefunden")
             sys.exit()
         print('Vertrags-ID zum Verlaengern gefunden: ' + serverContractID)
-        # br, loggedIn = self.loginEuserv()
+        br, loggedIn = self.loginEuserv()
         if not loggedIn:
             sys.exit()
+        saveJson(jsonData={'': datetime.now().timestamp}, filepath=PATH_SAVESTATE)
         return None
 
-
+def setFormBySubmitKey(br, submitKey: str) -> bool:
+    if submitKey is None:
+        return False
+    current_index = 0
+    for form in br.forms():
+        for control in form.controls:
+            if control.name is None:
+                continue
+            if control.name == submitKey:
+                br.select_form(nr=current_index)
+                return True
+        current_index += 1
+    return False
 
 
 def crawlMailsBySubject(connection, subject: str) -> list:
@@ -165,6 +196,10 @@ def loadJson(filepath: str):
     readFile.close()
     return json.loads(settingsJson)
 
+def saveJson(jsonData, filepath):
+    with open(filepath, 'w') as outfile:
+        json.dump(jsonData, outfile)
+
 def getNewBrowser():
     # Prepare browser
     br = mechanize.Browser()
@@ -190,7 +225,9 @@ def parse_list_response(line):
 
 
 if __name__ == '__main__':
-    # TODO: Add errorhandling
+    my_parser = argparse.ArgumentParser()
+    my_parser.add_argument('-t', '--test_logins', help='Nur Logins testen und dann beenden.', type=bool, default=False)
+    args = my_parser.parse_args()
     try:
         config = loadJson('config.json')
     except Exception as e:
@@ -198,4 +235,9 @@ if __name__ == '__main__':
         sys.exit()
 
     euservContractUpdater = ContractUpdater(cfg=config)
-    euservContractUpdater.run()
+    if args.test_logins:
+        euservContractUpdater.loginMail()
+        euservContractUpdater.loginEuserv()
+        sys.exit()
+    else:
+        euservContractUpdater.run()
