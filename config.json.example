@@ -1,0 +1,7 @@
+{
+  "imap_server": "imap.example.tld",
+  "imap_login": "example@example.de",
+  "imap_password": "examplePassword",
+  "euserv_mail_or_user_id": "example@example.de",
+  "euserv_password": "examplePassword"
+}
