@@ -1,17 +1,26 @@
 import argparse
+import logging
 from datetime import datetime
 import imaplib
 import json
 import os
 import re
 import sys
+from pathlib import Path
 
 import mechanize
+import pydantic
+from imap_tools import MailBox, AND, MailboxLoginError
 from mechanize import FormNotFoundError
 
 EUSERV_BASE = 'https://support.euserv.com/'
 PATH_COOKIES = os.path.join('cookies.txt')
 PATH_SAVESTATE = os.path.join('savestate.json')
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.WARNING)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.DEBUG)
+
 
 def isLoggedInEuserv(html: str) -> bool:
     if 'action=logout' in html:
@@ -19,38 +28,39 @@ def isLoggedInEuserv(html: str) -> bool:
     else:
         return False
 
+
 # Converts html bytes from response object to String
 def getHTML(response):
     return response.read().decode('utf-8', 'ignore')
 
 
+class Config(pydantic.BaseModel):
+    imap_server: str
+    imap_login: str
+    imap_password: str
+    euserv_mail_or_user_id: str
+    euserv_password: str
+
+
+def getConfig() -> Config:
+    currentPath = Path(os.getcwd())
+    # Go to parent as config is contained in root folder of project
+    configpath = os.path.join('config.json')
+    print(f'Loading config from {configpath}')
+    with open(configpath, encoding='utf-8') as infile:
+        jsondict = json.load(infile)
+        return Config(**jsondict)
+
+
 class ContractUpdater:
 
-
     def __init__(self, cfg: dict):
-        # TODO: Add errorhandling for missing keys
         try:
-            self.imap_server = cfg['imap_server']
-            self.imap_login = cfg['imap_login']
-            self.imap_password = cfg['imap_password']
-            self.euserv_login = cfg['euserv_mail_or_user_id']
-            self.euserv_password = cfg['euserv_password']
-        except KeyError as e:
+            self.config = getConfig()
+        except Exception as e:
             print(e)
             print('Kaputte config: Ein- oder mehrere Eintraege fehlen!')
             sys.exit()
-
-    def loginMail(self):
-        try:
-            connection = imaplib.IMAP4_SSL(self.imap_server)
-            connection.login(self.imap_login, self.imap_password)
-            print('E-Mail Login erfolgreich')
-            return connection
-        except Exception as ex:
-            print(ex)
-            print('E-Mail Login fehlgeschlagen!')
-            print('Falls du GMail Benutzer bist, aktiviere den Zugriff durch weniger sichere Apps hier: https://myaccount.google.com/lesssecureapps')
-            return None
 
     def loginEuserv(self):
         br = getNewBrowser()
@@ -81,8 +91,8 @@ class ContractUpdater:
                 br.form.new_control('text', 'sess_id', {'sess_id': ''})
 
                 br.form.fixup()
-                br['email'] = self.euserv_login
-                br['password'] = self.euserv_password
+                br['email'] = self.config.euserv_mail_or_user_id
+                br['password'] = self.config.euserv_password
                 br['form_selected_language'] = 'de'
                 br['Submit'] = 'Anmelden'
                 br['subaction'] = 'login'
@@ -97,7 +107,7 @@ class ContractUpdater:
             # TODO: Add support for 2FA login
             pass
         if not isLoggedInEuserv(html):
-            print('Login fehlgeschlagen - Ungueltige Zugangsdaten?')
+            print('Euserv Login fehlgeschlagen - Ungueltige Zugangsdaten?')
             return br, False
         print('Euserv Login erfolgreich')
         # Store cookies so we can re-use them next time
@@ -106,55 +116,37 @@ class ContractUpdater:
         return br, True
 
     def run(self):
-        connection = self.loginMail()
-        if connection is None:
-            # Login failure
-            sys.exit()
-        typ, data = connection.list()
-        if typ != 'OK':
-            # E.g. 'NO' = Invalid mailbox (should never happen)
-            print("Keine Postfaecher gefunden")
-            return
         print('Sammle Vertragsverlaengerungs-E-Mails ...')
 
-        # This can be used to speed-up the checking process - users can blacklist postboxes through this list
-        postbox_ignore = ['Sent']
-        numberof_postboxes = len(data)
-        postbox_index = 0
-        total_postbox_steps = 2
-        mails = []
-        for line in data:
-            postbox_index += 1
-            flags, delimiter, mailbox_name = parse_list_response(line)
-            print('Arbeite an Postfach %d / %d: \'%s\' ...' % (postbox_index, numberof_postboxes, mailbox_name))
-            if mailbox_name in postbox_ignore:
-                # Rare case
-                print(f'Ueberspringe aktuelles Postfach {mailbox_name}, da es sich auf der Blacklist befindet')
-                continue
-            # Surround mailbox_name  with brackets otherwise this will fail for email labels containing spaces
-            typ, data = connection.select('"' + mailbox_name + '"', readonly=True)
-            if typ != 'OK':
-                # E.g. NO = Invalid mailbox (should never happen)
-                print(f'Fehler: Postfach {mailbox_name} konnte nicht geoeffnet werden')
-                # 2020-01-03: Skip invalid mailboxes - this may happen frequently with gmail accounts (missing permissions?)
-                continue
-            # Search for specific messages by subject
-            mails += crawlMailsBySubject(connection, 'Anstehende manuelle Vertragsverlaengerung fuer Vertrag')
-        serverContractID = None
-        for mail in mails:
-            regex = re.compile(r'Vertrag\s*[^:]+:\s*(\d+)').search(mail)
-            if regex is not None:
-                serverContractID = regex.group(1)
-                break
-        if serverContractID is None:
-            print("Es wurde keine Mail zur anstehenden Vertragsverlaengerung gefunden")
+        try:
+            with MailBox(self.config.imap_server).login(self.config.imap_login, self.config.imap_password) as mailbox:
+                timestamp = datetime.now().timestamp() - 24 * 60 * 60
+                targetdate = datetime.fromtimestamp(timestamp).date()
+                mails = mailbox.fetch(mark_seen=False, criteria=AND(subject='Anstehende manuelle Vertragsverlaengerung fuer Vertrag', date_gte=targetdate))
+                contractIDs = []
+                for msg in mails:
+                    emailBody = msg.html
+                    regex = re.compile(r'(?i)Sie den Vertrag (\d+) aus').search(emailBody)
+                    if regex is None:
+                        raise Exception("Fatal: Failed to find contractID in email:\n" + emailBody)
+                    contractID = regex.group(1)
+                    contractIDs.append(contractID)
+                if len(contractIDs) == 0:
+                    print("Keine Vertragsverlaengerungsemail gefunden")
+                    sys.exit()
+                elif len(contractIDs) > 1:
+                    pass
+        except MailboxLoginError:
+            print("Ungueltige Email Zugangsdaten")
             sys.exit()
+        serverContractID = contractIDs[0]
         print('Vertrags-ID zum Verlaengern gefunden: ' + serverContractID)
         br, loggedIn = self.loginEuserv()
         if not loggedIn:
             sys.exit()
         saveJson(jsonData={'': datetime.now().timestamp}, filepath=PATH_SAVESTATE)
         return None
+
 
 def setFormBySubmitKey(br, submitKey: str) -> bool:
     if submitKey is None:
@@ -196,9 +188,11 @@ def loadJson(filepath: str):
     readFile.close()
     return json.loads(settingsJson)
 
+
 def saveJson(jsonData, filepath):
     with open(filepath, 'w') as outfile:
         json.dump(jsonData, outfile)
+
 
 def getNewBrowser():
     # Prepare browser
@@ -209,7 +203,7 @@ def getNewBrowser():
     br.set_handle_referer(True)
     br.set_handle_redirect(True)
     br.addheaders = [('User-agent',
-                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36')]
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36')]
     return br
 
 
