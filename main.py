@@ -71,6 +71,9 @@ class ContractUpdater:
         self.br = getNewBrowser()
         self.mailbox = MailBox(self.config.imap_server)
 
+    def getMainpageURL(self, sessionid: str) -> str:
+        return EUSERV_BASE_INDEX + '?sess_id=' + sessionid + '&action=show_default'
+
     def ensureMailLogin(self):
         if self.mailbox.login_result is None:
             """ We're not yet logged in -> Login """
@@ -89,7 +92,7 @@ class ContractUpdater:
             # Try to login via stored cookies first
             print(f'Versuche Login ueber zuvor gespeicherte Cookies mit {last_phpsessid=} ...')
             # self.br.addheaders.append(('Referer', EUSERV_BASE_INDEX + '?sess_id=' + last_phpsessid))
-            response = self.br.open(EUSERV_BASE_INDEX + '?sess_id=' + last_phpsessid + '&action=show_default')
+            response = self.br.open(self.getMainpageURL(last_phpsessid))
             html = getHTML(response)
             if isLoggedInEuserv(html):
                 print("Cookie login erfolgreich")
@@ -183,8 +186,14 @@ class ContractUpdater:
             raise Exception("Ungueltiger Loginstatus")
         print('Euserv Login erfolgreich')
         self.config.last_phpsessid = sess_id
+        # TODO: Remove those fields on successful login
+        # self.config.last_date_login_attempt_failed = None
+        # self.config.last_date_login_attempt_failed_captcha = None
         # Store cookies in file so we can try to re-use them next time
         self.br.cookiejar.save(ignore_expires=True)
+        self.saveConfig()
+
+
 
     def browserGetCookieByKey(self, key: str) -> Union[str, None]:
         for cookie in self.br.cookiejar:
@@ -193,6 +202,7 @@ class ContractUpdater:
         return None
 
     def mailFindContractID(self) -> str:
+        """ Sucht nach "Vertragsverlängerungs Emails" und gibt die erste ID eines verlängerbaren Vertrags zurück. """
         self.ensureMailLogin()
         print('Sammle Vertragsverlaengerungs-E-Mails ...')
         lastHoursToCheck = 48
@@ -231,7 +241,6 @@ class ContractUpdater:
         while secondsWaited < secondsWaitMax:
             time.sleep(secondsWaitPerLoop)
             secondsWaited += secondsWaitPerLoop
-            print(f"Warte auf Login-PIN | Sekunden gewartet: {secondsWaited}/{secondsWaitMax}")
             timestamp = datetime.now().timestamp() - 5 * 60
             targetdate = datetime.fromtimestamp(timestamp).date()
             mails = self.mailbox.fetch(mark_seen=False, criteria=AND(subject='EUserv - Versuchter Login', date_gte=targetdate), reverse=True)
@@ -246,7 +255,7 @@ class ContractUpdater:
                 loginpin = regex.group(1)
                 print("Login PIN gefunden: " + loginpin)
                 return loginpin
-            print("Noch keine PIN-Mail gefunden")
+            print(f"Noch keine PIN-Mail gefunden | Sekunden gewartet: {secondsWaited}/{secondsWaitMax}")
         raise Exception("Fata: PIN-Mail nicht gefunden")
 
     def mailFindContractExtendPIN(self) -> str:
@@ -286,7 +295,9 @@ class ContractUpdater:
 
     def extendContract(self, contractID: str):
         self.loginEuserv()
-        html = getHTML(self.br.response())
+        mainurl = self.getMainpageURL(self.config.last_phpsessid)
+        print(f"Vorbereitung: Öffne Startseite: {mainurl}")
+        html = getHTML(self.br.open(mainurl))
         contractExtendUrlRegex = re.compile(r"\"(/index\.iphp\?[^\"]*show_contract_extension=1[^\"].*" + contractID + "[^\"]*)").search(html)
         if contractExtendUrlRegex is None:
             raise Exception("Fatal: Failed to find prolongContractURL")
