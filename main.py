@@ -26,7 +26,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 def isLoggedInEuserv(html: Union[str, None]) -> bool:
     if html is None:
         return False
-    elif 'action=logout' in html:
+    elif 'action=logout' in html and "class=\"kc2_customer_box_content\"" in html:
+        """ Important: 'action=logout' will also exist when we are only partially logged in e.g.
+        username + pw -> PIN or captcha (not logged in yet!) so we need to check for the presence of other elements """
         return True
     else:
         return False
@@ -86,8 +88,6 @@ class ContractUpdater:
     def loginEuserv(self):
         # TODO: Fix loadCookies handling (?)
         last_phpsessid = self.config.last_phpsessid
-        response = None
-        html = None
         if len(self.br.cookiejar) > 0 and last_phpsessid is not None:
             # Try to login via stored cookies first
             print(f'Versuche Login ueber zuvor gespeicherte Cookies mit {last_phpsessid=} ...')
@@ -112,7 +112,7 @@ class ContractUpdater:
             raise Exception("Konnte session_id nicht finden")
         sess_id = sess_idRegex.group(1)
         print("Aktive Session: " + sess_id)
-        # Important!
+        # Important! Accessing this fake image activates the current session_id and allows us to use it to login.
         self.br.open("https://support.euserv.com/pic/logo_small.png")
         self.br.open(EUSERV_BASE_INDEX + '?sess_id=' + sess_id)
         html = getHTML(response)
@@ -235,9 +235,9 @@ class ContractUpdater:
     def mailFindLoginPIN(self) -> str:
         self.ensureMailLogin()
         secondsWaited = 0
-        secondsWaitMax = 600
+        secondsWaitMax = 1200
         secondsWaitPerLoop = 10
-        print("Warte auf Login-PIN...")
+        print(f"Warte auf Login-PIN | Warte {secondsWaitPerLoop} Sekunden...")
         while secondsWaited < secondsWaitMax:
             time.sleep(secondsWaitPerLoop)
             secondsWaited += secondsWaitPerLoop
@@ -255,21 +255,21 @@ class ContractUpdater:
                 loginpin = regex.group(1)
                 print("Login PIN gefunden: " + loginpin)
                 return loginpin
-            print(f"Noch keine PIN-Mail gefunden | Sekunden gewartet: {secondsWaited}/{secondsWaitMax}")
-        raise Exception("Fata: PIN-Mail nicht gefunden")
+            print(f"Noch keine PIN-Mail gefunden | Sekunden gewartet: {secondsWaited}/{secondsWaitMax} | Warte {secondsWaitPerLoop} Sekunden...")
+        raise Exception(f"Fatal: Timeout: PIN-Mail nicht innerhalb von {secondsWaitMax} Sekunden gefunden")
 
     def mailFindContractExtendPIN(self) -> str:
         self.ensureMailLogin()
         secondsWaited = 0
-        secondsWaitMax = 600
+        secondsWaitMax = 1200
         secondsWaitPerLoop = 10
-        print(f"Warte auf Vertragsverlängerungs-PIN max {secondsWaitMax} Sekunden mit {secondsWaitPerLoop} Sekunden Abstand pro Versuch...")
+        print(f"Warte auf Vertragsverlängerungs-PIN | Warte {secondsWaitPerLoop} Sekunden...")
         pins = set()
         firstPIN = None
         while secondsWaited < secondsWaitMax:
             time.sleep(secondsWaitPerLoop)
             secondsWaited += secondsWaitPerLoop
-            print(f"Warte auf Vertragsverlängerungs-PIN | Sekunden gewartet: {secondsWaited}/{secondsWaitMax}")
+
             timestamp = datetime.now().timestamp() - 5 * 60
             targetdate = datetime.fromtimestamp(timestamp).date()
             mails = self.mailbox.fetch(mark_seen=False, criteria=AND(subject='EUserv - PIN zur', date_gte=targetdate), reverse=True)
@@ -280,6 +280,7 @@ class ContractUpdater:
                     # Maybe forwarded email?
                     regex = re.compile(r'(?i)PIN\s*:\s*\r\n(\d{6})').search(msg.text)
                     if regex is None:
+                        # This should never happen
                         raise Exception("Fatal: Konnte Vertragsverlängerungspin nicht finden in Email:\n" + msg.html + " | Text: " + msg.text)
                 pin = regex.group(1)
                 pins.add(pin)
@@ -287,8 +288,9 @@ class ContractUpdater:
                     firstPIN = pin
             if len(pins) > 0:
                 break
+            print(f"Vertragsverlängerungs-PIN noch nicht gefunden | Sekunden gewartet: {secondsWaited}/{secondsWaitMax} | Warte {secondsWaitPerLoop} Sekunden...")
         if len(pins) == 0:
-            raise Exception("Fata: VertragsverlängerungsPIN-Mail nicht gefunden")
+            raise Exception(f"Fatal: Timeout: VertragsverlängerungsPIN-Mail nicht innerhalb von {secondsWaitMax} Sekunden gefunden")
         if len(pins) > 1:
             print(f"Warnung: Es wurden mehrere ({len(pins)}) Vertragsverlängerungs-PINs gefunden: {pins} | Es wird nur die erste probiert")
         return firstPIN
