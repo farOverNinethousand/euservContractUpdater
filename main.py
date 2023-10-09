@@ -235,7 +235,7 @@ class ContractUpdater:
     def mailFindLoginPIN(self) -> str:
         self.ensureMailLogin()
         secondsWaited = 0
-        secondsWaitMax = 1200
+        secondsWaitMax = 1 * 60 * 60
         secondsWaitPerLoop = 10
         print(f"Warte auf Login-PIN | Warte {secondsWaitPerLoop} Sekunden...")
         while secondsWaited < secondsWaitMax:
@@ -261,7 +261,7 @@ class ContractUpdater:
     def mailFindContractExtendPIN(self) -> str:
         self.ensureMailLogin()
         secondsWaited = 0
-        secondsWaitMax = 1200
+        secondsWaitMax = 1 * 60 * 60
         secondsWaitPerLoop = 10
         print(f"Warte auf Vertragsverlängerungs-PIN | Warte {secondsWaitPerLoop} Sekunden...")
         pins = set()
